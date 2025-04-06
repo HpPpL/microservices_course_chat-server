@@ -42,14 +42,14 @@ type MessageInfo struct {
 var (
 	// General PG errors
 	errFailedBuildQuery = errors.New("failed to build query")
-	errChatDoesntExist  = errors.New("user with current id doesn't exist")
+	errChatDoesntExist  = errors.New("chat with current id doesn't exist")
 
 	// Create errors
-	errFailedInsertChat = errors.New("failed to insert user")
+	errFailedInsertChat = errors.New("failed to insert chat")
 	errUsernamesISEmpty = errors.New("usernames is empty")
 
 	// Delete errors
-	errFailedDeleteUser = errors.New("failed to delete user")
+	errFailedDeleteChat = errors.New("failed to delete chat")
 )
 
 // Create part
@@ -77,11 +77,11 @@ func (s *server) Create(ctx context.Context, req *desc.CreateRequest) (*desc.Cre
 	var ChatID int64
 	err = s.pool.QueryRow(ctx, query, args...).Scan(&ChatID)
 	if err != nil {
-		log.Printf("failed to insert user: %v", err)
+		log.Printf("failed to insert chat: %v", err)
 		return &desc.CreateResponse{}, errFailedInsertChat
 	}
 
-	log.Printf("inserted user with id: %v", ChatID)
+	log.Printf("inserted chat with id: %v", ChatID)
 	return &desc.CreateResponse{
 		Id: ChatID,
 	}, nil
@@ -104,7 +104,7 @@ func (s *server) Delete(ctx context.Context, req *desc.DeleteRequest) (*emptypb.
 	res, err := s.pool.Exec(ctx, query, args...)
 	if err != nil {
 		log.Printf("failed to delete chat: %v", err)
-		return &emptypb.Empty{}, errFailedDeleteUser
+		return &emptypb.Empty{}, errFailedDeleteChat
 	}
 
 	if res.RowsAffected() == 0 {
