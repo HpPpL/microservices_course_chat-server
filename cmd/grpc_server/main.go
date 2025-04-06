@@ -3,94 +3,120 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
-	"google.golang.org/protobuf/types/known/emptypb"
+	"flag"
 	"log"
 	"net"
-	"sync"
 	"time"
 
-	"crypto/rand"
-	"math/big"
+	sq "github.com/Masterminds/squirrel"
+
+	"github.com/jackc/pgx/v4/pgxpool"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
-	//"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/HpPpL/microservices_course_chat-server/internal/config"
 	desc "github.com/HpPpL/microservices_course_chat-server/pkg/chat_server_v1"
 )
 
-const grpcPort = 50052
+// Path to config
+var configPath string
+
+func init() {
+	flag.StringVar(&configPath, "config-path", ".env", "path to config file")
+}
 
 type server struct {
 	desc.UnimplementedChatServerV1Server
+	pool *pgxpool.Pool
 }
 
+// MessageInfo is a message structure from user to server
 type MessageInfo struct {
 	from      string
 	text      string
 	timestamp time.Time
 }
-type ChatMap struct {
-	elems map[int64][]string
-	m     sync.RWMutex
-}
-
-var chats = &ChatMap{
-	elems: make(map[int64][]string),
-}
 
 var (
+	// General PG errors
+	errFailedBuildQuery = errors.New("failed to build query")
+	errChatDoesntExist  = errors.New("user with current id doesn't exist")
+
 	// Create errors
-	usernamesIsEmpty   = errors.New("usernames is empty")
-	idGenerationFailed = errors.New("id generation failed")
+	errFailedInsertChat = errors.New("failed to insert user")
+	errUsernamesISEmpty = errors.New("usernames is empty")
 
 	// Delete errors
-	badID = errors.New("id is incorrect")
+	errFailedDeleteUser = errors.New("failed to delete user")
 )
 
 // Create part
 func (s *server) Create(ctx context.Context, req *desc.CreateRequest) (*desc.CreateResponse, error) {
+	log.Print("There is create request!")
+
 	users := req.GetUsernames()
 	if len(users) == 0 {
 		log.Printf("Usernames is empty")
-		return &desc.CreateResponse{}, usernamesIsEmpty
+		return &desc.CreateResponse{}, errUsernamesISEmpty
 	}
 
-	maxNum := big.NewInt(0).Lsh(big.NewInt(1), 63)
-	n, err := rand.Int(rand.Reader, maxNum)
+	builderInsert := sq.Insert("chats").
+		PlaceholderFormat(sq.Dollar).
+		Columns("users").
+		Values(users).
+		Suffix("RETURNING id")
+
+	query, args, err := builderInsert.ToSql()
 	if err != nil {
-		log.Print("Id generation failed")
-		return &desc.CreateResponse{}, idGenerationFailed
+		log.Printf("failed to build query: %v", err)
+		return &desc.CreateResponse{}, errFailedBuildQuery
 	}
-	// Можно потом добавить проверку на существование такого айди
-	id := n.Int64()
 
-	chats.m.Lock()
-	defer chats.m.Unlock()
-	chats.elems[id] = users
+	var ChatID int64
+	err = s.pool.QueryRow(ctx, query, args...).Scan(&ChatID)
+	if err != nil {
+		log.Printf("failed to insert user: %v", err)
+		return &desc.CreateResponse{}, errFailedInsertChat
+	}
 
-	return &desc.CreateResponse{Id: id}, nil
+	log.Printf("inserted user with id: %v", ChatID)
+	return &desc.CreateResponse{
+		Id: ChatID,
+	}, nil
 }
 
 // Delete part
 func (s *server) Delete(ctx context.Context, req *desc.DeleteRequest) (*emptypb.Empty, error) {
-	id := req.GetId()
+	ChatID := req.GetId()
 
-	if _, ok := chats.elems[id]; !ok {
-		log.Printf("Bad id")
-		return &emptypb.Empty{}, badID
+	builderDelete := sq.Delete("chats").
+		PlaceholderFormat(sq.Dollar).
+		Where(sq.Eq{"id": ChatID})
+
+	query, args, err := builderDelete.ToSql()
+	if err != nil {
+		log.Printf("failed to build query: %v", err)
+		return &emptypb.Empty{}, errFailedBuildQuery
 	}
 
-	chats.m.Lock()
-	defer chats.m.Unlock()
+	res, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		log.Printf("failed to delete chat: %v", err)
+		return &emptypb.Empty{}, errFailedDeleteUser
+	}
 
-	delete(chats.elems, id)
+	if res.RowsAffected() == 0 {
+		return &emptypb.Empty{}, errChatDoesntExist
+	}
+
+	log.Printf("Deleted %d rows", res.RowsAffected())
 	return &emptypb.Empty{}, nil
 }
 
 // SendMessage part
-func (s *server) SendMessage(ctx context.Context, req *desc.SendMessageRequest) (*emptypb.Empty, error) {
+func (s *server) SendMessage(_ context.Context, req *desc.SendMessageRequest) (*emptypb.Empty, error) {
 	message := MessageInfo{
 		from:      req.GetMessage().GetFrom(),
 		text:      req.GetMessage().GetText(),
@@ -103,14 +129,38 @@ func (s *server) SendMessage(ctx context.Context, req *desc.SendMessageRequest) 
 }
 
 func main() {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
+	flag.Parse()
+	ctx := context.Background()
+
+	err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+
+	grpcConfig, err := config.NewGRPCConfig()
+	if err != nil {
+		log.Fatalf("failed to get grpc config")
+	}
+
+	pgConfig, err := config.NewPGConfig()
+	if err != nil {
+		log.Fatalf("failed to get pg config")
+	}
+
+	lis, err := net.Listen("tcp", grpcConfig.Address())
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
+	pool, err := pgxpool.Connect(ctx, pgConfig.DSN())
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
 	s := grpc.NewServer()
 	reflection.Register(s)
-	desc.RegisterChatServerV1Server(s, &server{})
+	desc.RegisterChatServerV1Server(s, &server{pool: pool})
 
 	log.Printf("server listening at %v", lis.Addr())
 

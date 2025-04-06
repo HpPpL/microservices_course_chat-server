@@ -11,6 +11,7 @@ RUN go build -o ./bin/crud_chat_server ./cmd/grpc_server/main.go
 FROM alpine:latest
 
 WORKDIR /root/
+COPY prod.env .env
 COPY --from=builder /github.com/HpPpL/microservices_course_chat-server/grpc/source/bin/crud_chat_server .
 
 CMD ["./crud_chat_server"]
